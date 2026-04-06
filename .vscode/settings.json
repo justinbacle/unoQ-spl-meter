@@ -1,0 +1,6 @@
+{
+  // ── UNO Q connection — update these if your board's IP changes ──────────────
+  "unoQ.ip": "192.168.1.146",
+  "unoQ.user": "arduino",
+  "unoQ.appDir": "~/ArduinoApps/mobile_spl"
+}

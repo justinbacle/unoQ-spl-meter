@@ -1,0 +1,66 @@
+{
+  // Board connection settings live in .vscode/settings.json (unoQ.ip / unoQ.user / unoQ.appDir).
+  // Requires OpenSSH (built into Windows 10/11).  Set up key auth once with:
+  //   ssh-keygen -t ed25519 -f ~/.ssh/unoq_key
+  //   ssh-copy-id -i ~/.ssh/unoq_key arduino@<IP>
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // Run once per project to create the remote app directory.
+      "label": "Uno Q: Init Remote",
+      "type": "shell",
+      "command": "ssh ${config:unoQ.user}@${config:unoQ.ip} 'mkdir -p ${config:unoQ.appDir}'",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      // SCP only the app files to the board (excludes .git, .history, .vscode).
+      "label": "Uno Q: Deploy",
+      "type": "shell",
+      "command": "scp",
+      "args": [
+        "-r",
+        "${workspaceFolder}/app.yaml",
+        "${workspaceFolder}/python",
+        "${workspaceFolder}/sketch",
+        "${config:unoQ.user}@${config:unoQ.ip}:${config:unoQ.appDir}/"
+      ],
+      "group": "build",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      // Start the app on the board (compiles MCU sketch + starts Python on MPU).
+      // First run may take a few minutes to download libraries.
+      "label": "Uno Q: Start",
+      "type": "shell",
+      "command": "ssh ${config:unoQ.user}@${config:unoQ.ip} 'arduino-app-cli app start ${config:unoQ.appDir}'",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Uno Q: Stop",
+      "type": "shell",
+      "command": "ssh ${config:unoQ.user}@${config:unoQ.ip} 'arduino-app-cli app stop ${config:unoQ.appDir}'",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Uno Q: Logs",
+      "type": "shell",
+      "command": "ssh ${config:unoQ.user}@${config:unoQ.ip} 'arduino-app-cli app logs ${config:unoQ.appDir}'",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      // Default build task: deploy, stop (ignore failure), start.
+      "label": "Uno Q: Deploy & Start",
+      "type": "shell",
+      "command": "scp -r '${workspaceFolder}/app.yaml' '${workspaceFolder}/python' '${workspaceFolder}/sketch' ${config:unoQ.user}@${config:unoQ.ip}:${config:unoQ.appDir}/ && ssh ${config:unoQ.user}@${config:unoQ.ip} 'arduino-app-cli app stop ${config:unoQ.appDir}; arduino-app-cli app start ${config:unoQ.appDir}'",
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    }
+  ]
+}
+

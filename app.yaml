@@ -1,0 +1,7 @@
+name: Mobile SPL Meter
+description: "Dual-channel precision sound level meter (STM32 MCU + Qualcomm MPU)"
+icon: 🔊
+version: "0.1.0"
+
+ports: []
+bricks: []
