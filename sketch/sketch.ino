@@ -1,5 +1,56 @@
 #include "Arduino_LED_Matrix.h"
 
+// ── Microphone configuration ────────────────────────────────
+static const uint8_t NUM_MICS            = 2;
+static const uint8_t MIC_PINS[NUM_MICS]  = { A0, A1 };
+static const float   MIC_SENSITIVITY_DBV = -42.0f;  // SPH8878: -42 dBV/Pa
+static const float   CAL_OFFSET          =   0.0f;  // per-unit calibration (dB)
+
+// Which input to measure: 0..NUM_MICS-1 = single mic, NUM_MICS = average all
+static uint8_t activeMic = 0;
+
+// ── Sampling configuration ──────────────────────────────────
+static const uint32_t SAMPLE_RATE = 48000;            // Hz
+static const uint16_t BLOCK_SIZE  = 480;              // samples per block (10 ms)
+static const int16_t  ADC_MID     = 8192;             // 14-bit midpoint (2^13)
+
+// One block of raw ADC samples, filled by collectBlock()
+static int16_t sampleBuf[BLOCK_SIZE];
+
+// Collect one block of BLOCK_SIZE samples at SAMPLE_RATE using spin-wait timing.
+// If activeMic < NUM_MICS: reads that single mic.
+// If activeMic == NUM_MICS: reads all mics and averages each sample.
+static void collectBlock() {
+  const uint32_t tickUs = 1000000UL / SAMPLE_RATE;  // ~20 µs at 48 kHz
+  uint32_t tNext = micros();
+  for (uint16_t i = 0; i < BLOCK_SIZE; i++) {
+    if (activeMic < NUM_MICS) {
+      sampleBuf[i] = (int16_t)analogRead(MIC_PINS[activeMic]) - ADC_MID;
+    } else {
+      int32_t sum = 0;
+      for (uint8_t m = 0; m < NUM_MICS; m++)
+        sum += analogRead(MIC_PINS[m]);
+      sampleBuf[i] = (int16_t)(sum / NUM_MICS) - ADC_MID;
+    }
+    tNext += tickUs;
+    while ((int32_t)(micros() - tNext) < 0) { /* spin */ }
+  }
+}
+
+// ── DC offset removal ───────────────────────────────────────
+// EMA high-pass: corner ~10 Hz at 48 kHz → alpha = 1 - 2π·10/48000 ≈ 0.99869
+static const float DC_ALPHA = 0.99869f;
+static float dcState = 0.0f;  // reset when activeMic changes
+
+// Remove DC from sampleBuf in-place; updates dcState across blocks.
+static void removeDC() {
+  for (uint16_t i = 0; i < BLOCK_SIZE; i++) {
+    dcState = DC_ALPHA * dcState + (1.0f - DC_ALPHA) * sampleBuf[i];
+    sampleBuf[i] = (int16_t)(sampleBuf[i] - dcState);
+  }
+}
+
+// ── Display configuration ───────────────────────────────────
 static const bool    DISPLAY_FLIPPED = true;
 static const uint8_t ROWS     = 8;
 static const uint8_t COLS     = 13;
@@ -86,6 +137,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis()<3000) {}
   matrix.begin();
+  analogReadResolution(14);  // STM32U585 supports 14-bit ADC (0-16383)
   Serial.println(F("mobile_spl Phase 1 - 35-130dB sweep"));
 }
 
