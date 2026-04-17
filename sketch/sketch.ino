@@ -6,7 +6,7 @@
 // ════════════════════════════════════════════════════════════
 
 #define DEMO_MODE 0           // 1 = synthetic sweep, 0 = live mic input
-#define TEST_PWM_D9   1       // 1 = drive D9 with 500 Hz PWM for A0 bench test, 0 = normal
+#define TEST_PWM_D9   0       // 1 = drive D9 with 500 Hz PWM for A0 bench test, 0 = normal
 #define TEST_PWM_DUTY 127U    // analogWrite value (0-255)
 #define TEST_PWM_RES  8U      // analogWriteResolution bits
 
@@ -35,6 +35,9 @@
 // ── Clip warning ────────────────────────────────────────────
 #define CLIP_FLASH_MS  200U   // half-period of clip-flash blink (ms)
 #define CLIP_FLASH_BG  2U     // brightness for off-pixels during clip flash (0-7); content stays readable
+
+// ── Leq partial-period indicator ────────────────────────────
+#define LEQ_PARTIAL_BRIGHTNESS 3U // digit brightness before first full period completes
 
 // ── Nav switch (Qwiic PCA9554) ──────────────────────────────
 #define NAV_ADDR  0x20        // PCA9554 default I2C address
@@ -85,9 +88,10 @@ static Biquad cFilt[2] = {
 };
 
 // Leq accumulator
-static float    leqEnergySum  = 0.0f;
-static uint16_t leqBlockCount = 0;
-static float    leqDB         = 0.0f;
+static float    leqEnergySum     = 0.0f;
+static uint16_t leqBlockCount    = 0;
+static float    leqDB            = 0.0f;
+static bool     leqPeriodComplete = false; // true after first full 60-s period
 
 // Navigation switch (Qwiic PCA9554 via Wire1 — no external library needed)
 static bool    navPresent   = false;
@@ -209,12 +213,17 @@ static float energyToDB(float ms) {
 }
 
 // Accumulate mean-square energy directly — no powf() needed.
+// leqDB is updated every block as a running average, so it shows a live
+// partial Leq immediately rather than staying at 0 for the first full period.
 static void accumulateLeq(float ms) {
   leqEnergySum += ms;
-  if (++leqBlockCount >= LEQ_PERIOD) {
-    leqDB         = energyToDB(leqEnergySum / LEQ_PERIOD);
+  ++leqBlockCount;
+  leqDB = energyToDB(leqEnergySum / leqBlockCount); // always up-to-date
+  if (leqBlockCount >= LEQ_PERIOD) {
+    leqPeriodComplete = true;
     leqEnergySum  = 0.0f;
     leqBlockCount = 0;
+    // leqDB retains the just-computed full-period value until next update
   }
 }
 
@@ -222,10 +231,10 @@ static void accumulateLeq(float ms) {
 // ── Display pipeline ─────────────────────────────────────────
 // ════════════════════════════════════════════════════════════
 
-static void stampGlyph(const uint8_t glyph[5], uint8_t col, uint8_t row) {
+static void stampGlyph(const uint8_t glyph[5], uint8_t col, uint8_t row, uint8_t bright = DIGIT_BRIGHTNESS) {
   for (uint8_t r = 0; r < 5 && (row + r) < ROWS; r++)
     for (uint8_t c = 0; c < 3 && (col + c) < COLS; c++)
-      frameBuf[row + r][col + c] = ((glyph[r] >> (2u - c)) & 0x01u) ? DIGIT_BRIGHTNESS : 0;
+      frameBuf[row + r][col + c] = ((glyph[r] >> (2u - c)) & 0x01u) ? bright : 0;
 }
 
 static void stampSmallGlyph(const uint8_t glyph[4], uint8_t col, uint8_t row) {
@@ -234,9 +243,9 @@ static void stampSmallGlyph(const uint8_t glyph[4], uint8_t col, uint8_t row) {
       frameBuf[row + r][col + c] = ((glyph[r] >> (2u - c)) & 0x01u) ? LETTER_BRIGHTNESS : 0;
 }
 
-static void stampNarrowOne(uint8_t col, uint8_t row) {
+static void stampNarrowOne(uint8_t col, uint8_t row, uint8_t bright = DIGIT_BRIGHTNESS) {
   for (uint8_t r = 0; r < 5 && (row + r) < ROWS; r++)
-    frameBuf[row + r][col] = DIGIT_BRIGHTNESS;
+    frameBuf[row + r][col] = bright;
 }
 
 static void rotateFrame180() {
@@ -249,14 +258,15 @@ static void rotateFrame180() {
   }
 }
 
-static void displaySPL(int db, WeightMode mode) {
+static void displaySPL(int db, WeightMode mode, bool partial = false) {
   if (db < 0) db = 0;
   if (db > 199) db = 199; // display can only render 0-199 cleanly
   // Clear only the digit/letter rows — bottom row (row 7) is owned by updateBottomRow
   for (uint8_t r = 0; r < ROWS - 1; r++) memset(frameBuf[r], 0, COLS);
-  if (db >= 100) stampNarrowOne(0, FONT_ROW);
-  stampGlyph(DIGIT[(db % 100) / 10], 2, FONT_ROW);
-  stampGlyph(DIGIT[db % 10],         6, FONT_ROW);
+  uint8_t dBright = partial ? (uint8_t)LEQ_PARTIAL_BRIGHTNESS : (uint8_t)DIGIT_BRIGHTNESS;
+  if (db >= 100) stampNarrowOne(0, FONT_ROW, dBright);
+  stampGlyph(DIGIT[(db % 100) / 10], 2, FONT_ROW, dBright);
+  stampGlyph(DIGIT[db % 10],         6, FONT_ROW, dBright);
   stampSmallGlyph(LETTER[mode], 10, LETTER_ROW);
 }
 
@@ -401,10 +411,11 @@ static void pollNavSwitch() {
     lastDisplayed = -1;
   }
   if (fell & (1u << NAV_CENTER)) {                               // reset Leq
-    leqEnergySum  = 0.0f;
-    leqBlockCount = 0;
-    leqDB         = 0.0f;
-    lastDisplayed = -1;
+    leqEnergySum      = 0.0f;
+    leqBlockCount     = 0;
+    leqDB             = 0.0f;
+    leqPeriodComplete = false;
+    lastDisplayed     = -1;
   }
 }
 
@@ -475,7 +486,8 @@ void loop() {
     int   intVal = (int)(val + 0.5f);
     if (intVal != lastDisplayed) {
       lastDisplayed = intVal;
-      displaySPL(intVal, currentMode);
+      bool partial = (currentMode == MODE_LEQ) && !leqPeriodComplete;
+      displaySPL(intVal, currentMode, partial);
     }
     updateBottomRow(db);
     commitFrame();
