@@ -1,4 +1,5 @@
 #include "Arduino_LED_Matrix.h"
+#include <Arduino_RouterBridge.h>
 #include <Wire.h>
 
 // ════════════════════════════════════════════════════════════
@@ -12,7 +13,10 @@
 
 // ── Microphone ──────────────────────────────────────────────
 #define NUM_MICS             2
-#define MIC_SENSITIVITY_DBV  (-42.0f)  // SPH8878LR5H-1: -42 dBV/Pa
+// SPH8878LR5H-1 raw: -44 dBV/Pa typical (single-ended)
+// SparkFun breakout OPA344 gain: 64x = +36.12 dB
+// Effective breakout sensitivity: -44 + 36.12 = -7.88 dBV/Pa
+#define MIC_SENSITIVITY_DBV  (-7.9f)
 #define CAL_OFFSET           (0.0f)    // per-unit trim (dB)
 
 // ── Sampling ────────────────────────────────────────────────
@@ -46,7 +50,8 @@
 // ── Types ───────────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════
 
-enum WeightMode { MODE_A = 0, MODE_C = 1, MODE_LEQ = 2 };
+enum WeightMode { MODE_A = 0, MODE_C = 1, MODE_LEQ = 2, MODE_DIAG = 3 };
+#define NUM_MODES 4
 
 // Direct-Form-II transposed biquad.
 // typedef is required so the Arduino preprocessor can prototype functions
@@ -61,7 +66,7 @@ static const uint8_t MIC_PINS[NUM_MICS] = { A0, A1 };
 
 // Which input to measure: 0..NUM_MICS-1 = single mic, NUM_MICS = average all
 static uint8_t    activeMic   = 0;
-static WeightMode currentMode = MODE_A;
+static volatile WeightMode currentMode = MODE_A;
 
 // Audio buffers
 static int16_t sampleBuf[BLOCK_SIZE];
@@ -71,20 +76,23 @@ static float   weightBuf[BLOCK_SIZE];
 static const float DC_ALPHA = 0.99869f;
 static float dcState = 0.0f;
 
-// A-weighting cascade — 3 biquads, Fs=48 kHz, IEC 61672 analog poles
-//   stage 0: ~20.6 Hz  double pole
-//   stage 1: ~107.7 Hz + ~737.9 Hz poles
-//   stage 2: ~12194 Hz double pole
+// A-weighting cascade — 3 biquads, Fs=48 kHz, IEC 61672
+//   stage 0: HP 20.6 Hz double pole + 2 zeros at DC
+//   stage 1: LP 107.7 Hz + 737.9 Hz poles (NO zeros at DC)
+//   stage 2: HP 12194 Hz double pole + 2 zeros at DC
+// Per-stage normalized so b coefficients stay in float32 range.
 static Biquad aFilt[3] = {
-  {1,-2,1,-1.99462f,0.99462f,0,0},
-  {1,-2,1,-1.89392f,0.89521f,0,0},
-  {1,-2,1,-0.22456f,0.01261f,0,0},
+  { 0.9977310085f,-1.9954620170f, 0.9977310085f, -1.9946144527f, 0.9946217038f, 0,0},
+  { 0.0050850145f, 0.0101700290f, 0.0050850145f, -1.8938018760f, 0.8950921285f, 0,0},
+  {59.9270479676f,-119.854095935f,59.9270479676f,  0.0254243152f, 0.0001615990f, 0,0},
 };
 
-// C-weighting cascade — 2 biquads (outer poles only)
+// C-weighting cascade — 2 biquads, Fs=48 kHz, IEC 61672
+//   stage 0: HP 20.6 Hz double pole + 2 zeros at DC
+//   stage 1: LP 12194 Hz double pole (NO zeros at DC)
 static Biquad cFilt[2] = {
-  {1,-2,1,-1.99462f,0.99462f,0,0},
-  {1,-2,1,-0.22456f,0.01261f,0,0},
+  {0.9977310085f,-1.9954620170f, 0.9977310085f, -1.9946144527f, 0.9946217038f, 0,0},
+  {0.2574433331f, 0.5148866662f, 0.2574433331f,  0.0254243152f, 0.0001615990f, 0,0},
 };
 
 // Leq accumulator
@@ -121,12 +129,23 @@ static const uint8_t DIGIT[10][5] = {
   {0b111,0b101,0b111,0b001,0b011},
 };
 
-// 3×4 mode letters: A, C, L
-static const uint8_t LETTER[3][4] = {
+// 3×4 mode letters: A, C, L, D
+static const uint8_t LETTER[4][4] = {
   {0b010,0b101,0b111,0b101}, // A
   {0b011,0b100,0b100,0b011}, // C
   {0b100,0b100,0b100,0b111}, // L
+  {0b110,0b101,0b101,0b110}, // D (diagnostic)
 };
+
+// Diagnostic sub-modes: what value to display
+enum DiagSub { DIAG_RAW_RMS = 0, DIAG_WT_RMS = 1, DIAG_RAW_MV = 2, DIAG_DB_UNWEIGHTED = 3 };
+#define NUM_DIAG_SUBS 4
+static DiagSub diagSub = DIAG_RAW_RMS;
+static float diagRawMs = 0.0f;   // raw mean-square (latest block)
+static float diagWtMs  = 0.0f;   // weighted mean-square (latest block)
+
+// VU refresh counter — file scope so nav handler can force immediate redraw
+static uint8_t vuCount = 0;
 
 #if DEMO_MODE
 static int  simDB   = 35;
@@ -342,9 +361,10 @@ static const uint8_t NAV_LED_R  = 7;
 static void updateNavLED() {
   if (!navPresent) return;
   uint8_t out = 0xFF;  // all HIGH = all LEDs off (active LOW)
-  if (currentMode == MODE_A)   out &= ~(1u << NAV_LED_R);
-  if (currentMode == MODE_C)   out &= ~(1u << NAV_LED_G);
-  if (currentMode == MODE_LEQ) out &= ~(1u << NAV_LED_B);
+  if (currentMode == MODE_A)    out &= ~(1u << NAV_LED_R);
+  if (currentMode == MODE_C)    out &= ~(1u << NAV_LED_G);
+  if (currentMode == MODE_LEQ)  out &= ~(1u << NAV_LED_B);
+  if (currentMode == MODE_DIAG) { out &= ~(1u << NAV_LED_R); out &= ~(1u << NAV_LED_G); } // yellow
   Wire1.beginTransmission(NAV_ADDR);
   Wire1.write(PCA9554_REG_OUT);
   Wire1.write(out);
@@ -357,7 +377,7 @@ static void setupNavSwitch() {
   Wire1.beginTransmission(NAV_ADDR);
   navPresent = (Wire1.endTransmission() == 0);
   if (!navPresent) {
-    Serial.println(F("Nav switch not found on Qwiic (non-fatal)"));
+    Monitor.println(F("Nav switch not found on Qwiic (non-fatal)"));
     return;
   }
   // GPIO0-4 = inputs (buttons), GPIO5-7 = outputs (LEDs)
@@ -371,7 +391,7 @@ static void setupNavSwitch() {
   Wire1.write(0xFF);
   Wire1.endTransmission();
   updateNavLED();
-  Serial.println(F("Nav switch online"));
+  Monitor.println(F("Nav switch online"));
 }
 
 // Called every 10 ms (once per audio block).
@@ -393,12 +413,12 @@ static void pollNavSwitch() {
   if (!fell) return;
 
   if (fell & (1u << NAV_RIGHT)) {                                // next mode
-    currentMode   = static_cast<WeightMode>((currentMode + 1) % 3);
+    currentMode   = static_cast<WeightMode>((currentMode + 1) % NUM_MODES);
     lastDisplayed = -1;
     updateNavLED();
   }
   if (fell & (1u << NAV_LEFT)) {                                 // prev mode
-    currentMode   = static_cast<WeightMode>((currentMode + 2) % 3);
+    currentMode   = static_cast<WeightMode>((currentMode + NUM_MODES - 1) % NUM_MODES);
     lastDisplayed = -1;
     updateNavLED();
   }
@@ -410,12 +430,19 @@ static void pollNavSwitch() {
     activeMic     = (activeMic + NUM_MICS) % (NUM_MICS + 1);
     lastDisplayed = -1;
   }
-  if (fell & (1u << NAV_CENTER)) {                               // reset Leq
-    leqEnergySum      = 0.0f;
-    leqBlockCount     = 0;
-    leqDB             = 0.0f;
-    leqPeriodComplete = false;
-    lastDisplayed     = -1;
+  if (fell & (1u << NAV_CENTER)) {
+    if ((int)currentMode == 3) {                                 // cycle diag sub-mode
+      diagSub = static_cast<DiagSub>((diagSub + 1) % NUM_DIAG_SUBS);
+      lastDisplayed = -1;
+      vuCount = 4;                                               // force redraw next block
+      updateNavLED();                                            // blink LED as confirmation
+    } else {                                                     // reset Leq
+      leqEnergySum      = 0.0f;
+      leqBlockCount     = 0;
+      leqDB             = 0.0f;
+      leqPeriodComplete = false;
+      lastDisplayed     = -1;
+    }
   }
 }
 
@@ -424,8 +451,8 @@ static void pollNavSwitch() {
 // ════════════════════════════════════════════════════════════
 
 void setup() {
-  Serial.begin(115200);
-  while (!Serial && millis() < 3000) {}
+  Bridge.begin();
+  Monitor.begin();
   matrix.begin();
   matrix.setGrayscaleBits(3);  // 8 brightness levels (0-7)
   analogReadResolution(14);
@@ -441,67 +468,117 @@ void setup() {
     testExpectedDB = 20.0f * (logf(vRms) * 0.4342944819f)
                      - MIC_SENSITIVITY_DBV + 94.0f + CAL_OFFSET;
   }
-  Serial.print(F("TEST_PWM_D9: duty=")); Serial.print(TEST_PWM_DUTY);
-  Serial.print(F("/")); Serial.print((1u << TEST_PWM_RES) - 1u);
-  Serial.print(F("  expected=")); Serial.print(testExpectedDB, 1);
-  Serial.println(F(" dBSPL (unweighted, ideal rails)"));
+  Monitor.print(F("TEST_PWM_D9: duty=")); Monitor.print(TEST_PWM_DUTY);
+  Monitor.print(F("/")); Monitor.print((1u << TEST_PWM_RES) - 1u);
+  Monitor.print(F("  expected=")); Monitor.print(testExpectedDB, 1);
+  Monitor.println(F(" dBSPL (unweighted, ideal rails)"));
   // Auto-calibrate: warm up filters then average 50 blocks against the known signal
-  Serial.println(F("  calibrating..."));
+  Monitor.println(F("  calibrating..."));
   for (uint8_t i = 0; i < 20; i++) { collectBlock(); removeDC(); applyWeighting(MODE_A); } // warm-up
   float calEnergySum = 0.0f;
   for (uint8_t i = 0; i < 50; i++) { collectBlock(); removeDC(); applyWeighting(MODE_A); calEnergySum += computeEnergy(); }
   float measuredDB = energyToDB(calEnergySum / 50.0f); // runtimeCalOffset still 0 here
   runtimeCalOffset = testExpectedDB - measuredDB;
-  Serial.print(F("  measured=")); Serial.print(measuredDB, 1);
-  Serial.print(F("  cal_offset=")); Serial.println(runtimeCalOffset, 1);
+  Monitor.print(F("  measured=")); Monitor.print(measuredDB, 1);
+  Monitor.print(F("  cal_offset=")); Monitor.println(runtimeCalOffset, 1);
 #endif
-  Serial.println(DEMO_MODE ? F("mobile_spl DEMO sweep") : F("mobile_spl live"));
+  Monitor.println(DEMO_MODE ? F("mobile_spl DEMO sweep") : F("mobile_spl live"));
 }
 
 void loop() {
 #if DEMO_MODE
   WeightMode mode = static_cast<WeightMode>((simDB / 10) % 3);
   displaySPL(simDB, mode);
-  Serial.print(F("sim dB = ")); Serial.println(simDB);
+  Monitor.print(F("sim dB = ")); Monitor.println(simDB);
   sweepUp ? simDB++ : simDB--;
   if (simDB >= 130) sweepUp = false;
   if (simDB <= 35)  sweepUp = true;
   delay(150);
 #else
   static uint8_t blockCount = 0;
-  static uint8_t vuCount    = 0;
 
   pollNavSwitch();
   collectBlock();
   removeDC();
-  applyWeighting(currentMode);
+
+  // Compute raw (unweighted) energy every block for diagnostics
+  {
+    float rawSum = 0.0f;
+    for (uint16_t i = 0; i < BLOCK_SIZE; i++)
+      rawSum += (float)sampleBuf[i] * (float)sampleBuf[i];
+    diagRawMs = rawSum / BLOCK_SIZE;
+  }
+
+  // Apply weighting — DIAG mode still runs A-weight so LEQ stays valid
+  applyWeighting((currentMode == MODE_DIAG) ? MODE_A : currentMode);
   float energy = computeEnergy();
+  diagWtMs = energy;
   float db     = energyToDB(energy);
   accumulateLeq(energy);
 
   // VU meter + mic dots: refresh every 5 blocks (50 ms)
   if (++vuCount >= 5) {
     vuCount = 0;
-    float val    = (currentMode == MODE_LEQ) ? leqDB : db;
-    int   intVal = (int)(val + 0.5f);
-    if (intVal != lastDisplayed) {
-      lastDisplayed = intVal;
-      bool partial = (currentMode == MODE_LEQ) && !leqPeriodComplete;
-      displaySPL(intVal, currentMode, partial);
+    if ((int)currentMode == 3) {
+      // Diagnostic display: show raw values depending on diagSub
+      float diagVal = 0.0f;
+      switch (diagSub) {
+        case DIAG_RAW_RMS:       diagVal = sqrtf(diagRawMs); break;       // ADC counts RMS
+        case DIAG_WT_RMS:        diagVal = sqrtf(diagWtMs); break;        // weighted ADC counts RMS
+        case DIAG_RAW_MV:        diagVal = sqrtf(diagRawMs) / 16383.0f * 3300.0f; break; // millivolts
+        case DIAG_DB_UNWEIGHTED: diagVal = energyToDB(diagRawMs); break;  // dB from raw signal
+      }
+      int intVal = (int)(diagVal + 0.5f);
+      // Force redraw every cycle in diag mode
+      lastDisplayed = -1;
+      // Clear ALL rows including bottom
+      memset(frameBuf, 0, sizeof(frameBuf));
+      // Show value as up to 2 digits + sub-mode number
+      if (intVal > 99) intVal = 99;
+      if (intVal < 0)  intVal = 0;
+      stampGlyph(DIGIT[intVal / 10], 2, FONT_ROW);
+      stampGlyph(DIGIT[intVal % 10], 6, FONT_ROW);
+      // Show sub-mode number (1-4) at full brightness
+      stampGlyph(DIGIT[(uint8_t)diagSub + 1], 10, FONT_ROW, DIGIT_BRIGHTNESS);
+      // Bottom row: bar length indicates sub-mode
+      for (uint8_t c = 0; c < 10; c++)
+        frameBuf[7][c] = (c < (10u - (uint8_t)diagSub * 3u)) ? DIGIT_BRIGHTNESS : 0;
+    } else {
+      float val    = (currentMode == MODE_LEQ) ? leqDB : db;
+      int   intVal = (int)(val + 0.5f);
+      if (intVal != lastDisplayed) {
+        lastDisplayed = intVal;
+        bool partial = (currentMode == MODE_LEQ) && !leqPeriodComplete;
+        displaySPL(intVal, currentMode, partial);
+      }
+      updateBottomRow(db);
     }
-    updateBottomRow(db);
     commitFrame();
   }
 
   if (++blockCount >= 25) {
     blockCount = 0;
+    // Compute raw (unweighted) energy for diagnostics
+    float rawSum = 0.0f;
+    for (uint16_t i = 0; i < BLOCK_SIZE; i++)
+      rawSum += (float)sampleBuf[i] * (float)sampleBuf[i];
+    float rawMs = rawSum / BLOCK_SIZE;
+    float rawRms = sqrtf(rawMs);
+    float rawVrms = rawRms / 16383.0f * 3.3f;
+    float weightedRms = sqrtf(energy);
+    float weightedVrms = weightedRms / 16383.0f * 3.3f;
+
     float val = (currentMode == MODE_LEQ) ? leqDB : db;
 #if TEST_PWM_D9
-    Serial.print(F("measured=")); Serial.print(val, 1);
-    Serial.print(F("  expected=")); Serial.print(testExpectedDB, 1);
-    Serial.print(F("  delta=")); Serial.println(val - testExpectedDB, 1);
+    Monitor.print(F("measured=")); Monitor.print(val, 1);
+    Monitor.print(F("  expected=")); Monitor.print(testExpectedDB, 1);
+    Monitor.print(F("  delta=")); Monitor.println(val - testExpectedDB, 1);
 #else
-    Serial.print(F("dB = ")); Serial.println(val, 1);
+    Monitor.print(F("raw_adc_rms=")); Monitor.print(rawRms, 1);
+    Monitor.print(F("  raw_mV=")); Monitor.print(rawVrms * 1000.0f, 3);
+    Monitor.print(F("  wt_adc_rms=")); Monitor.print(weightedRms, 1);
+    Monitor.print(F("  wt_mV=")); Monitor.print(weightedVrms * 1000.0f, 3);
+    Monitor.print(F("  dB=")); Monitor.println(val, 1);
 #endif
   }
 #endif
