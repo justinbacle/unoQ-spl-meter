@@ -77,22 +77,23 @@ static const float DC_ALPHA = 0.99869f;
 static float dcState = 0.0f;
 
 // A-weighting cascade — 3 biquads, Fs=48 kHz, IEC 61672
-//   stage 0: HP 20.6 Hz double pole + 2 zeros at DC
-//   stage 1: LP 107.7 Hz + 737.9 Hz poles (NO zeros at DC)
-//   stage 2: HP 12194 Hz double pole + 2 zeros at DC
-// Per-stage normalized so b coefficients stay in float32 range.
+// Generated via scipy bilinear_zpk + zpk2sos, normalized to 0 dB at 1 kHz.
+//   stage 0: LP  12194 Hz double pole (gain-scaled for 0 dB @ 1 kHz)
+//   stage 1: HP  zeros at DC + 107.7/737.9 Hz poles
+//   stage 2: HP  zeros at DC + 20.6 Hz double pole
 static Biquad aFilt[3] = {
-  { 0.9977310085f,-1.9954620170f, 0.9977310085f, -1.9946144527f, 0.9946217038f, 0,0},
-  { 0.0050850145f, 0.0101700290f, 0.0050850145f, -1.8938018760f, 0.8950921285f, 0,0},
-  {59.9270479676f,-119.854095935f,59.9270479676f,  0.0254243152f, 0.0001615990f, 0,0},
+  { 0.2341830426f, 0.4683660852f, 0.2341830426f, -0.2245584581f, 0.0126066253f, 0,0},
+  { 1.0000000000f,-2.0000000000f, 1.0000000000f, -1.8938704947f, 0.8951597691f, 0,0},
+  { 1.0000000000f,-2.0000000000f, 1.0000000000f, -1.9946144560f, 0.9946217070f, 0,0},
 };
 
 // C-weighting cascade — 2 biquads, Fs=48 kHz, IEC 61672
-//   stage 0: HP 20.6 Hz double pole + 2 zeros at DC
-//   stage 1: LP 12194 Hz double pole (NO zeros at DC)
+// Generated via scipy bilinear_zpk + zpk2sos, normalized to 0 dB at 1 kHz.
+//   stage 0: LP  12194 Hz double pole (gain-scaled for 0 dB @ 1 kHz)
+//   stage 1: HP  zeros at DC + 20.6 Hz double pole
 static Biquad cFilt[2] = {
-  {0.9977310085f,-1.9954620170f, 0.9977310085f, -1.9946144527f, 0.9946217038f, 0,0},
-  {0.2574433331f, 0.5148866662f, 0.2574433331f,  0.0254243152f, 0.0001615990f, 0,0},
+  { 0.1978907070f, 0.3957814140f, 0.1978907070f, -0.2245584581f, 0.0126066253f, 0,0},
+  { 1.0000000000f,-2.0000000000f, 1.0000000000f, -1.9946144560f, 0.9946217070f, 0,0},
 };
 
 // Leq accumulators: [0]=A-weighted (LAeq), [1]=C-weighted (LCeq)
