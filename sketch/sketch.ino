@@ -50,7 +50,7 @@
 // ── Types ───────────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════
 
-enum WeightMode { MODE_A = 0, MODE_C = 1, MODE_LEQ = 2, MODE_DIAG = 3 };
+enum WeightMode { MODE_A = 0, MODE_C = 1, MODE_LAEQ = 2, MODE_LCEQ = 3 };
 #define NUM_MODES 4
 
 // Direct-Form-II transposed biquad.
@@ -95,11 +95,11 @@ static Biquad cFilt[2] = {
   {0.2574433331f, 0.5148866662f, 0.2574433331f,  0.0254243152f, 0.0001615990f, 0,0},
 };
 
-// Leq accumulator
-static float    leqEnergySum     = 0.0f;
-static uint16_t leqBlockCount    = 0;
-static float    leqDB            = 0.0f;
-static bool     leqPeriodComplete = false; // true after first full 60-s period
+// Leq accumulators: [0]=A-weighted (LAeq), [1]=C-weighted (LCeq)
+static float    leqEnergySum[2]      = {0.0f, 0.0f};
+static uint16_t leqBlockCount[2]     = {0, 0};
+static float    leqDB[2]             = {0.0f, 0.0f};
+static bool     leqPeriodComplete[2]  = {false, false};
 
 // Navigation switch (Qwiic PCA9554 via Wire1 — no external library needed)
 static bool    navPresent   = false;
@@ -129,20 +129,15 @@ static const uint8_t DIGIT[10][5] = {
   {0b111,0b101,0b111,0b001,0b011},
 };
 
-// 3×4 mode letters: A, C, L, D
+// 3×4 mode letters: A, C, L, L
 static const uint8_t LETTER[4][4] = {
   {0b010,0b101,0b111,0b101}, // A
   {0b011,0b100,0b100,0b011}, // C
-  {0b100,0b100,0b100,0b111}, // L
-  {0b110,0b101,0b101,0b110}, // D (diagnostic)
+  {0b100,0b100,0b100,0b111}, // L (LAeq)
+  {0b100,0b100,0b100,0b111}, // L (LCeq)
 };
 
-// Diagnostic sub-modes: what value to display
-enum DiagSub { DIAG_RAW_RMS = 0, DIAG_WT_RMS = 1, DIAG_RAW_MV = 2, DIAG_DB_UNWEIGHTED = 3 };
-#define NUM_DIAG_SUBS 4
-static DiagSub diagSub = DIAG_RAW_RMS;
-static float diagRawMs = 0.0f;   // raw mean-square (latest block)
-static float diagWtMs  = 0.0f;   // weighted mean-square (latest block)
+
 
 // VU refresh counter — file scope so nav handler can force immediate redraw
 static uint8_t vuCount = 0;
@@ -231,18 +226,15 @@ static float energyToDB(float ms) {
   return 20.0f * (logf(vRms) * 0.4342944819f) - MIC_SENSITIVITY_DBV + 94.0f + CAL_OFFSET + runtimeCalOffset;
 }
 
-// Accumulate mean-square energy directly — no powf() needed.
-// leqDB is updated every block as a running average, so it shows a live
-// partial Leq immediately rather than staying at 0 for the first full period.
-static void accumulateLeq(float ms) {
-  leqEnergySum += ms;
-  ++leqBlockCount;
-  leqDB = energyToDB(leqEnergySum / leqBlockCount); // always up-to-date
-  if (leqBlockCount >= LEQ_PERIOD) {
-    leqPeriodComplete = true;
-    leqEnergySum  = 0.0f;
-    leqBlockCount = 0;
-    // leqDB retains the just-computed full-period value until next update
+// Accumulate mean-square energy into one of the two Leq accumulators.
+static void accumulateLeq(uint8_t idx, float ms) {
+  leqEnergySum[idx] += ms;
+  ++leqBlockCount[idx];
+  leqDB[idx] = energyToDB(leqEnergySum[idx] / leqBlockCount[idx]);
+  if (leqBlockCount[idx] >= LEQ_PERIOD) {
+    leqPeriodComplete[idx] = true;
+    leqEnergySum[idx]  = 0.0f;
+    leqBlockCount[idx] = 0;
   }
 }
 
@@ -286,7 +278,16 @@ static void displaySPL(int db, WeightMode mode, bool partial = false) {
   if (db >= 100) stampNarrowOne(0, FONT_ROW, dBright);
   stampGlyph(DIGIT[(db % 100) / 10], 2, FONT_ROW, dBright);
   stampGlyph(DIGIT[db % 10],         6, FONT_ROW, dBright);
-  stampSmallGlyph(LETTER[mode], 10, LETTER_ROW);
+  // Leq modes: show weighting letter (A or C) with underline on row 6
+  if (mode == MODE_LAEQ) {
+    stampSmallGlyph(LETTER[MODE_A], 10, LETTER_ROW);
+    for (uint8_t c = 10; c < 13 && c < COLS; c++) frameBuf[6][c] = LETTER_BRIGHTNESS;
+  } else if (mode == MODE_LCEQ) {
+    stampSmallGlyph(LETTER[MODE_C], 10, LETTER_ROW);
+    for (uint8_t c = 10; c < 13 && c < COLS; c++) frameBuf[6][c] = LETTER_BRIGHTNESS;
+  } else {
+    stampSmallGlyph(LETTER[mode], 10, LETTER_ROW);
+  }
 }
 
 // Bottom row (row 7): VU bar cols 0-9, gap col 10, mic dots cols 11-12.
@@ -361,10 +362,10 @@ static const uint8_t NAV_LED_R  = 7;
 static void updateNavLED() {
   if (!navPresent) return;
   uint8_t out = 0xFF;  // all HIGH = all LEDs off (active LOW)
-  if (currentMode == MODE_A)    out &= ~(1u << NAV_LED_R);
-  if (currentMode == MODE_C)    out &= ~(1u << NAV_LED_G);
-  if (currentMode == MODE_LEQ)  out &= ~(1u << NAV_LED_B);
-  if (currentMode == MODE_DIAG) { out &= ~(1u << NAV_LED_R); out &= ~(1u << NAV_LED_G); } // yellow
+  if (currentMode == MODE_A)     out &= ~(1u << NAV_LED_R);
+  if (currentMode == MODE_C)     out &= ~(1u << NAV_LED_G);
+  if (currentMode == MODE_LAEQ)  out &= ~(1u << NAV_LED_B);
+  if (currentMode == MODE_LCEQ)  { out &= ~(1u << NAV_LED_B); out &= ~(1u << NAV_LED_G); } // cyan
   Wire1.beginTransmission(NAV_ADDR);
   Wire1.write(PCA9554_REG_OUT);
   Wire1.write(out);
@@ -430,19 +431,14 @@ static void pollNavSwitch() {
     activeMic     = (activeMic + NUM_MICS) % (NUM_MICS + 1);
     lastDisplayed = -1;
   }
-  if (fell & (1u << NAV_CENTER)) {
-    if ((int)currentMode == 3) {                                 // cycle diag sub-mode
-      diagSub = static_cast<DiagSub>((diagSub + 1) % NUM_DIAG_SUBS);
-      lastDisplayed = -1;
-      vuCount = 4;                                               // force redraw next block
-      updateNavLED();                                            // blink LED as confirmation
-    } else {                                                     // reset Leq
-      leqEnergySum      = 0.0f;
-      leqBlockCount     = 0;
-      leqDB             = 0.0f;
-      leqPeriodComplete = false;
-      lastDisplayed     = -1;
+  if (fell & (1u << NAV_CENTER)) {                               // reset both Leq accumulators
+    for (uint8_t i = 0; i < 2; i++) {
+      leqEnergySum[i]      = 0.0f;
+      leqBlockCount[i]     = 0;
+      leqDB[i]             = 0.0f;
+      leqPeriodComplete[i] = false;
     }
+    lastDisplayed = -1;
   }
 }
 
@@ -501,84 +497,56 @@ void loop() {
   collectBlock();
   removeDC();
 
-  // Compute raw (unweighted) energy every block for diagnostics
-  {
-    float rawSum = 0.0f;
-    for (uint16_t i = 0; i < BLOCK_SIZE; i++)
-      rawSum += (float)sampleBuf[i] * (float)sampleBuf[i];
-    diagRawMs = rawSum / BLOCK_SIZE;
-  }
+  // Always compute both A-weighted and C-weighted energy
+  applyWeighting(MODE_A);
+  float energyA = computeEnergy();
+  applyWeighting(MODE_C);
+  float energyC = computeEnergy();
 
-  // Apply weighting — DIAG mode still runs A-weight so LEQ stays valid
-  applyWeighting((currentMode == MODE_DIAG) ? MODE_A : currentMode);
-  float energy = computeEnergy();
-  diagWtMs = energy;
+  // Feed both LEQ accumulators every block
+  accumulateLeq(0, energyA);
+  accumulateLeq(1, energyC);
+
+  // Live dB for VU bar uses the weighting matching the current mode
+  float energy = (currentMode == MODE_C || currentMode == MODE_LCEQ) ? energyC : energyA;
   float db     = energyToDB(energy);
-  accumulateLeq(energy);
 
   // VU meter + mic dots: refresh every 5 blocks (50 ms)
   if (++vuCount >= 5) {
     vuCount = 0;
-    if ((int)currentMode == 3) {
-      // Diagnostic display: show raw values depending on diagSub
-      float diagVal = 0.0f;
-      switch (diagSub) {
-        case DIAG_RAW_RMS:       diagVal = sqrtf(diagRawMs); break;       // ADC counts RMS
-        case DIAG_WT_RMS:        diagVal = sqrtf(diagWtMs); break;        // weighted ADC counts RMS
-        case DIAG_RAW_MV:        diagVal = sqrtf(diagRawMs) / 16383.0f * 3300.0f; break; // millivolts
-        case DIAG_DB_UNWEIGHTED: diagVal = energyToDB(diagRawMs); break;  // dB from raw signal
-      }
-      int intVal = (int)(diagVal + 0.5f);
-      // Force redraw every cycle in diag mode
-      lastDisplayed = -1;
-      // Clear ALL rows including bottom
-      memset(frameBuf, 0, sizeof(frameBuf));
-      // Show value as up to 2 digits + sub-mode number
-      if (intVal > 99) intVal = 99;
-      if (intVal < 0)  intVal = 0;
-      stampGlyph(DIGIT[intVal / 10], 2, FONT_ROW);
-      stampGlyph(DIGIT[intVal % 10], 6, FONT_ROW);
-      // Show sub-mode number (1-4) at full brightness
-      stampGlyph(DIGIT[(uint8_t)diagSub + 1], 10, FONT_ROW, DIGIT_BRIGHTNESS);
-      // Bottom row: bar length indicates sub-mode
-      for (uint8_t c = 0; c < 10; c++)
-        frameBuf[7][c] = (c < (10u - (uint8_t)diagSub * 3u)) ? DIGIT_BRIGHTNESS : 0;
+    float val;
+    bool  partial = false;
+    if (currentMode == MODE_LAEQ) {
+      val     = leqDB[0];
+      partial = !leqPeriodComplete[0];
+    } else if (currentMode == MODE_LCEQ) {
+      val     = leqDB[1];
+      partial = !leqPeriodComplete[1];
     } else {
-      float val    = (currentMode == MODE_LEQ) ? leqDB : db;
-      int   intVal = (int)(val + 0.5f);
-      if (intVal != lastDisplayed) {
-        lastDisplayed = intVal;
-        bool partial = (currentMode == MODE_LEQ) && !leqPeriodComplete;
-        displaySPL(intVal, currentMode, partial);
-      }
-      updateBottomRow(db);
+      val = db;
     }
+    int intVal = (int)(val + 0.5f);
+    // Always redraw in Leq modes so partial→full brightness transition isn't missed
+    bool forceRedraw = (currentMode == MODE_LAEQ || currentMode == MODE_LCEQ);
+    if (intVal != lastDisplayed || forceRedraw) {
+      lastDisplayed = intVal;
+      displaySPL(intVal, currentMode, partial);
+    }
+    updateBottomRow(db);
     commitFrame();
   }
 
   if (++blockCount >= 25) {
     blockCount = 0;
-    // Compute raw (unweighted) energy for diagnostics
-    float rawSum = 0.0f;
-    for (uint16_t i = 0; i < BLOCK_SIZE; i++)
-      rawSum += (float)sampleBuf[i] * (float)sampleBuf[i];
-    float rawMs = rawSum / BLOCK_SIZE;
-    float rawRms = sqrtf(rawMs);
-    float rawVrms = rawRms / 16383.0f * 3.3f;
-    float weightedRms = sqrtf(energy);
-    float weightedVrms = weightedRms / 16383.0f * 3.3f;
-
-    float val = (currentMode == MODE_LEQ) ? leqDB : db;
 #if TEST_PWM_D9
-    Monitor.print(F("measured=")); Monitor.print(val, 1);
+    Monitor.print(F("measured=")); Monitor.print(db, 1);
     Monitor.print(F("  expected=")); Monitor.print(testExpectedDB, 1);
-    Monitor.print(F("  delta=")); Monitor.println(val - testExpectedDB, 1);
+    Monitor.print(F("  delta=")); Monitor.println(db - testExpectedDB, 1);
 #else
-    Monitor.print(F("raw_adc_rms=")); Monitor.print(rawRms, 1);
-    Monitor.print(F("  raw_mV=")); Monitor.print(rawVrms * 1000.0f, 3);
-    Monitor.print(F("  wt_adc_rms=")); Monitor.print(weightedRms, 1);
-    Monitor.print(F("  wt_mV=")); Monitor.print(weightedVrms * 1000.0f, 3);
-    Monitor.print(F("  dB=")); Monitor.println(val, 1);
+    Monitor.print(F("dBA=")); Monitor.print(energyToDB(energyA), 1);
+    Monitor.print(F("  dBC=")); Monitor.print(energyToDB(energyC), 1);
+    Monitor.print(F("  LAeq=")); Monitor.print(leqDB[0], 1);
+    Monitor.print(F("  LCeq=")); Monitor.println(leqDB[1], 1);
 #endif
   }
 #endif
