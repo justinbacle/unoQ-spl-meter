@@ -14,9 +14,9 @@ Build this on perfboard or a breadboard. No PCB software needed.
 | 1   | Resistor              | 9.1 kΩ 1%        | R_F2 — MID channel feedback      |
 | 1   | Resistor              | 1.0 kΩ 1%        | R_F3 — LOW channel feedback      |
 | 3   | Resistor              | 1.0 kΩ 1%        | R_G1–R_G3 — gain resistors       |
-| 6   | Resistor              | 100 kΩ           | R_BIAS — VCC/2 dividers (2 per mic)|
+| 6   | Resistor              | 100 kΩ           | R_BIAS — VCC/2 dividers (2 each) |
 | 3   | Capacitor             | 100 nF ceramic   | C_IN1–C_IN3 — AC coupling        |
-| 5   | Capacitor             | 100 nF ceramic   | Decoupling (1 per op-amp VCC, 1 per mic VCC, 1 spare)|
+| 5   | Capacitor             | 100 nF ceramic   | C_BYP — decoupling, op-amp + mic |
 | 1   | Capacitor             | 10 µF            | Bulk decoupling at power entry   |
 | 1   | 5-way nav switch      | ALPS SKQUCAA010  | Or any 5-direction tact switch   |
 
@@ -42,7 +42,7 @@ Gain formula: G = 1 + R_F / R_G
 
 ## Schematic — One Amplifier Channel (repeat × 3)
 
-```
+```text
 3.3V ──────┬─────────────────────────────────┐
            │                                 │
          [100k]  R_BIAS_A                  [100nF]  C_BYP  (close to U+ pin)
@@ -72,7 +72,7 @@ Gain formula: G = 1 + R_F / R_G
 
 ### Non-Inverting Amplifier with DC Bias — Redrawn Clearly
 
-```
+```text
                         3.3V
                          │
                        [100k]  ← R_BIAS_A
@@ -99,7 +99,7 @@ Mic AUD ──[100nF]──────────────── IN+ (sets 
 OPA2376 is a **dual** op-amp — two independent amplifiers in one 8-pin package.
 Use one package for channels HIGH + MID, second package for channel LOW (+ one spare).
 
-```
+```text
         OPA2376 SOIC-8
         ┌────────────┐
   OUT_A ┤ 1        8 ├ VCC  ─── 3.3V
@@ -116,7 +116,7 @@ Use one package for channels HIGH + MID, second package for channel LOW (+ one s
 
 ## Full Schematic — All Three Channels
 
-```
+```text
 3.3V ────┬──────────────────────────────────────────────────────────┐
          │                                                          │
        [10µF]  (bulk, at power entry)                            (to all VCC pins)
@@ -177,7 +177,7 @@ Each SparkFun mic breakout: place [100nF] on VCC pin → GND on the breakout its
 Use any 5-way tact switch (ALPS SKQUCAA010 or similar). Each direction is
 an independent normally-open contact.
 
-```
+```text
           ALPS SKQUCAA010 (top view)
                ┌─────┐
     UP    ────-┤  ↑  ├─── GND
@@ -203,38 +203,47 @@ Button press pulls the pin to GND → reads LOW → active.
 ## Step-by-Step Build (Perfboard)
 
 ### 1 — Power rail
+
 - Run a 3.3V rail and a GND rail along the top and bottom of the board.
 - Solder the 10 µF bulk cap between 3.3V and GND at the power entry point.
 
 ### 2 — Bias dividers (×3, one per channel)
+
 For each channel, solder two 100 kΩ resistors in series between 3.3V and GND.
 The midpoint of each pair is the BIAS point for that channel's IN+ input.
 
 ### 3 — Op-amp ICs
+
 - Solder U1 (OPA2376) and U2 (OPA2376) on SOIC-to-DIP adapters or directly
   to the perfboard with short leads.
 - Connect pin 8 (VCC) to 3.3V and pin 4 (GND) to GND on each package.
 - Solder a 100 nF cap from each VCC pin to GND immediately adjacent.
 
 ### 4 — Gain networks (per channel)
+
 For each of the three channels:
+
 1. Connect IN- to GND through R_G (1.0 kΩ).
 2. Connect a wire from IN- back to OUT.
 3. In that feedback wire, insert R_F (49.9k / 9.1k / 1.0k depending on channel).
 
 ### 5 — AC coupling and mic input (per channel)
+
 1. Solder the 100 nF cap in series between the SparkFun AUD pad and IN+.
 2. Connect the BIAS midpoint to IN+ (same node as the cap output).
 3. Connect the mic breakout VCC to 3.3V and GND to GND.
    Add a 100 nF cap on the breakout's VCC pin close to the mic.
 
 ### 6 — Output wires
+
 Run wires from each OUT pin to the Arduino Uno Q headers:
+
 - U1 OUT_A → A0
 - U1 OUT_B → A1
 - U2 OUT_A → A2
 
 ### 7 — Nav switch
+
 Solder the 5-way switch near a board edge. Connect each direction output to
 the corresponding Arduino digital pin (D2–D6). Connect all switch commons to GND.
 
@@ -258,6 +267,7 @@ the corresponding Arduino digital pin (D2–D6). Connect all switch commons to G
 ## Firmware Changes Needed for This Shield
 
 The current sketch (`sketch.ino`) is written for the prototype with:
+
 - 2 mics (A0, A1) at the same gain
 - Nav switch via I2C PCA9554
 
@@ -278,6 +288,7 @@ These changes are **not yet in the sketch** — they are the next firmware task.
 ## Test Points
 
 Before connecting to the Arduino:
+
 1. Power the board from 3.3V and measure the BIAS point on each channel: should be ~1.65V.
 2. Without audio input, measure each OUT: should be ~1.65V (DC-coupled op-amp at mid-rail).
 3. Apply audio (speak into each mic): verify the output swings around 1.65V.
