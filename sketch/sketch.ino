@@ -17,7 +17,8 @@
 
 // ── Sampling ────────────────────────────────────────────────
 #define SAMPLE_RATE  48000UL  // Hz
-#define BLOCK_SIZE   480      // samples per block → 10 ms
+#define BLOCK_SIZE   480 * 2      // samples per block → 10 ms
+// deoubled size, need to check if calibration was affected
 #define ADC_MID      8192     // 14-bit midpoint (2^13)
 
 // ── Display ─────────────────────────────────────────────────
@@ -30,8 +31,7 @@
 #define LETTER_BRIGHTNESS  4    // 0-7 grayscale: mode letter dimmer
 
 // ── Leq window ──────────────────────────────────────────────
-// Derived so the window is always 60 s regardless of BLOCK_SIZE.
-#define LEQ_PERIOD  ((SAMPLE_RATE / BLOCK_SIZE) * 60U)
+#define LEQ_PERIOD_MS  60000UL  // 60-second integration window (wall clock)
 
 // ── Clip warning ────────────────────────────────────────────
 #define CLIP_FLASH_MS  200U   // half-period of clip-flash blink (ms)
@@ -118,7 +118,8 @@ static float specDB[NUM_BANDS];         // EMA-smoothed per-band dB SPL
 
 // Leq accumulators: [0]=A-weighted (LAeq), [1]=C-weighted (LCeq)
 static float    leqEnergySum[2]      = {0.0f, 0.0f};
-static uint16_t leqBlockCount[2]     = {0, 0};
+static uint32_t leqBlockCount[2]     = {0, 0};  // blocks in current period (divisor only)
+static uint32_t leqStartMs[2]        = {0, 0};  // millis() at start of current period
 static float    leqDB[2]             = {0.0f, 0.0f};
 static bool     leqPeriodComplete[2]  = {false, false};
 
@@ -282,10 +283,11 @@ static void accumulateLeq(uint8_t idx, float ms) {
   leqEnergySum[idx] += ms;
   ++leqBlockCount[idx];
   leqDB[idx] = energyToDB(leqEnergySum[idx] / leqBlockCount[idx]);
-  if (leqBlockCount[idx] >= LEQ_PERIOD) {
+  if (millis() - leqStartMs[idx] >= LEQ_PERIOD_MS) {
     leqPeriodComplete[idx] = true;
     leqEnergySum[idx]  = 0.0f;
     leqBlockCount[idx] = 0;
+    leqStartMs[idx]    = millis();
   }
 }
 
@@ -484,9 +486,11 @@ static void pollNavSwitch() {
     lastDisplayed = -1;
   }
   if (fell & (1u << NAV_CENTER)) {                               // reset both Leq accumulators
+    uint32_t now = millis();
     for (uint8_t i = 0; i < 2; i++) {
       leqEnergySum[i]      = 0.0f;
       leqBlockCount[i]     = 0;
+      leqStartMs[i]        = now;
       leqDB[i]             = 0.0f;
       leqPeriodComplete[i] = false;
     }
@@ -510,12 +514,16 @@ void setup() {
 }
 
 void loop() {
-  static uint8_t blockCount = 0;
+  static uint8_t  blockCount = 0;
+  static uint32_t procUs     = 0;   // last measured processing time (µs)
+  static uint32_t procUsMax  = 0;   // worst-case since last report
 
   if (!Monitor) Monitor.begin();
 
   pollNavSwitch();
   collectBlock();
+
+  uint32_t tProcStart = micros();   // ← start timing here (after ADC, before DSP)
   removeDC();
 
   if (currentMode == MODE_SPECTRUM) {
@@ -525,6 +533,21 @@ void loop() {
       vuCount = 0;
       displaySpectrum();
       commitFrame();
+    }
+    if (++blockCount >= 25) {
+      blockCount = 0;
+      uint32_t blockUs = (uint32_t)BLOCK_SIZE * 1000000UL / SAMPLE_RATE;
+      uint32_t loadPct = procUsMax * 100UL / blockUs;
+      Monitor.print(F("spec"));
+      for (uint8_t b = 0; b < NUM_BANDS; b++) {
+        Monitor.print(F("  b")); Monitor.print(b); Monitor.print(F("="));
+        Monitor.print(specDB[b], 1);
+      }
+      Monitor.print(F("  proc=")); Monitor.print(procUs);
+      Monitor.print(F("us  max=")); Monitor.print(procUsMax);
+      Monitor.print(F("us  load=")); Monitor.print(loadPct);
+      Monitor.println(F("%"));
+      procUsMax = 0;
     }
   } else {
     // SPL / Leq modes: biquad-weighted energy
@@ -569,11 +592,23 @@ void loop() {
 
     if (++blockCount >= 25) {
       blockCount = 0;
+      // Block period = BLOCK_SIZE / SAMPLE_RATE seconds
+      uint32_t blockUs = (uint32_t)BLOCK_SIZE * 1000000UL / SAMPLE_RATE;
+      uint32_t loadPct = procUsMax * 100UL / blockUs;
       Monitor.print(F("dBA=")); Monitor.print(energyToDB(energyA), 1);
       Monitor.print(F("  dBC=")); Monitor.print(energyToDB(energyC), 1);
       Monitor.print(F("  LAeq=")); Monitor.print(leqDB[0], 1);
-      Monitor.print(F("  LCeq=")); Monitor.println(leqDB[1], 1);
+      Monitor.print(F("  LCeq=")); Monitor.print(leqDB[1], 1);
+      Monitor.print(F("  proc=")); Monitor.print(procUs);
+      Monitor.print(F("us  max=")); Monitor.print(procUsMax);
+      Monitor.print(F("us  load=")); Monitor.print(loadPct);
+      Monitor.println(F("%"));
+      procUsMax = 0;  // reset peak tracker
     }
   }
+
+  // Capture processing time (excludes ADC collection)
+  procUs = micros() - tProcStart;
+  if (procUs > procUsMax) procUsMax = procUs;
 }
 
