@@ -1,15 +1,11 @@
 #include "Arduino_LED_Matrix.h"
 #include <Arduino_RouterBridge.h>
 #include <Wire.h>
+#include "arduinoFFT.h"
 
 // ════════════════════════════════════════════════════════════
 // ── Build configuration  (edit here) ────────────────────────
 // ════════════════════════════════════════════════════════════
-
-#define DEMO_MODE 0           // 1 = synthetic sweep, 0 = live mic input
-#define TEST_PWM_D9   0       // 1 = drive D9 with 500 Hz PWM for A0 bench test, 0 = normal
-#define TEST_PWM_DUTY 127U    // analogWrite value (0-255)
-#define TEST_PWM_RES  8U      // analogWriteResolution bits
 
 // ── Microphone ──────────────────────────────────────────────
 #define NUM_MICS             2
@@ -34,7 +30,8 @@
 #define LETTER_BRIGHTNESS  4    // 0-7 grayscale: mode letter dimmer
 
 // ── Leq window ──────────────────────────────────────────────
-#define LEQ_PERIOD  6000U     // blocks  →  6000 × 10 ms = 60 s
+// Derived so the window is always 60 s regardless of BLOCK_SIZE.
+#define LEQ_PERIOD  ((SAMPLE_RATE / BLOCK_SIZE) * 60U)
 
 // ── Clip warning ────────────────────────────────────────────
 #define CLIP_FLASH_MS  200U   // half-period of clip-flash blink (ms)
@@ -50,8 +47,8 @@
 // ── Types ───────────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════
 
-enum WeightMode { MODE_A = 0, MODE_C = 1, MODE_LAEQ = 2, MODE_LCEQ = 3 };
-#define NUM_MODES 4
+enum WeightMode { MODE_A = 0, MODE_C = 1, MODE_LAEQ = 2, MODE_LCEQ = 3, MODE_SPECTRUM = 4 };
+#define NUM_MODES 5
 
 // Direct-Form-II transposed biquad.
 // typedef is required so the Arduino preprocessor can prototype functions
@@ -95,6 +92,29 @@ static Biquad cFilt[2] = {
   { 0.1978907070f, 0.3957814140f, 0.1978907070f, -0.2245584581f, 0.0126066253f, 0,0},
   { 1.0000000000f,-2.0000000000f, 1.0000000000f, -1.9946144560f, 0.9946217070f, 0,0},
 };
+
+// ── Spectrum mode (MODE_SPECTRUM) ───────────────────────────
+// FFT_SIZE is automatically the smallest power-of-2 ≥ BLOCK_SIZE.
+// At 48 kHz: bin width = SAMPLE_RATE / FFT_SIZE Hz.
+constexpr uint16_t nextPow2(uint16_t v, uint16_t p = 1) {
+  return p >= v ? p : nextPow2(v, p * 2u);
+}
+static constexpr uint16_t FFT_SIZE = nextPow2(BLOCK_SIZE);
+static_assert(FFT_SIZE >= 512, "FFT_SIZE < 512: band table invalid, keep BLOCK_SIZE >= 257");
+#define NUM_BANDS 13
+// Band edges are defined for a 512-pt FFT reference; SCALE_BIN adjusts to the actual FFT_SIZE.
+// Doubling FFT_SIZE halves the bin width, so all bin numbers double — the Hz ranges stay the same.
+#define SCALE_BIN(b) ((uint16_t)((uint32_t)(b) * FFT_SIZE / 512u))
+static const uint16_t SPEC_START[NUM_BANDS] = { SCALE_BIN(  1), SCALE_BIN(  2), SCALE_BIN(  3), SCALE_BIN(  4), SCALE_BIN(  6), SCALE_BIN(  9), SCALE_BIN( 13), SCALE_BIN( 20), SCALE_BIN( 31), SCALE_BIN( 47), SCALE_BIN( 72), SCALE_BIN(109), SCALE_BIN(167) };
+static const uint16_t SPEC_END[NUM_BANDS]   = { SCALE_BIN(  1), SCALE_BIN(  2), SCALE_BIN(  3), SCALE_BIN(  5), SCALE_BIN(  8), SCALE_BIN( 12), SCALE_BIN( 19), SCALE_BIN( 30), SCALE_BIN( 46), SCALE_BIN( 71), SCALE_BIN(108), SCALE_BIN(166), SCALE_BIN(255) };
+// dB display range: SPEC_DB_FLOOR (bottom pixel) to SPEC_DB_FLOOR+SPEC_DB_RANGE (top pixel)
+#define SPEC_DB_FLOOR 30.0f
+#define SPEC_DB_RANGE 80.0f   // 8 rows × 10 dB/row
+
+static float fftReal[FFT_SIZE];         // windowed input / real output after FFT
+static float fftImag[FFT_SIZE];         // imaginary output after FFT
+static ArduinoFFT<float> fft(fftReal, fftImag, FFT_SIZE, (float)SAMPLE_RATE);
+static float specDB[NUM_BANDS];         // EMA-smoothed per-band dB SPL
 
 // Leq accumulators: [0]=A-weighted (LAeq), [1]=C-weighted (LCeq)
 static float    leqEnergySum[2]      = {0.0f, 0.0f};
@@ -142,19 +162,6 @@ static const uint8_t LETTER[4][4] = {
 
 // VU refresh counter — file scope so nav handler can force immediate redraw
 static uint8_t vuCount = 0;
-
-#if DEMO_MODE
-static int  simDB   = 35;
-static bool sweepUp = true;
-#endif
-
-// Expected SPL for the D9 test signal, computed once in setup()
-#if TEST_PWM_D9
-static float testExpectedDB = 0.0f;
-#endif
-
-// Runtime calibration offset (dB) — auto-set by TEST_PWM_D9 calibration, 0 otherwise
-static float runtimeCalOffset = 0.0f;
 
 // ════════════════════════════════════════════════════════════
 // ── Audio pipeline ───────────────────────────────────────────
@@ -220,11 +227,54 @@ static float computeEnergy() {
   return sum / BLOCK_SIZE;
 }
 
+// Compute per-band dB SPL from the most recent sampleBuf via 512-pt RFFT.
+// Applies a Hann window, zero-pads to 512, then bins FFT output into NUM_BANDS
+// log-spaced bands. Results are EMA-smoothed into specDB[].
+static void computeSpectrum() {
+  // Fill fftReal: Hann-windowed samples + zero-pad; clear fftImag
+  const float invN1 = 1.0f / (float)(BLOCK_SIZE - 1);
+  for (uint16_t i = 0; i < BLOCK_SIZE; i++) {
+    float w = 0.5f * (1.0f - cosf(6.2831853f * i * invN1));
+    fftReal[i] = (float)sampleBuf[i] * w;
+  }
+  for (uint16_t i = BLOCK_SIZE; i < FFT_SIZE; i++) fftReal[i] = 0.0f;
+  memset(fftImag, 0, sizeof(fftImag));
+
+  // Forward FFT — output: fftReal[k] + j*fftImag[k] for bin k
+  fft.compute(FFTDirection::Forward);
+
+  // Map bins to bands, convert to dB SPL with EMA smoothing (α ≈ 0.35)
+  for (uint8_t b = 0; b < NUM_BANDS; b++) {
+    float sum = 0.0f;
+    for (uint16_t k = SPEC_START[b]; k <= SPEC_END[b]; k++) {
+      sum += fftReal[k] * fftReal[k] + fftImag[k] * fftImag[k];
+    }
+    // Parseval normalization: factor 2 (one-sided), divide by N² to recover
+    // mean-square ADC counts equivalent, then apply energyToDB calibration.
+    float ms = sum * 2.0f / ((float)FFT_SIZE * (float)FFT_SIZE);
+    float newDB = energyToDB(ms);
+    specDB[b] = 0.65f * specDB[b] + 0.35f * newDB;
+  }
+}
+
+// Render spectrum bars — each of the 13 columns is a frequency band,
+// bars grow from row 7 (bottom) upward, 10 dB per row.
+static void displaySpectrum() {
+  memset(frameBuf, 0, sizeof(frameBuf));
+  for (uint8_t col = 0; col < NUM_BANDS; col++) {
+    uint8_t barH = (uint8_t)constrain(
+      (specDB[col] - SPEC_DB_FLOOR) / SPEC_DB_RANGE * (float)ROWS,
+      0.0f, (float)ROWS);
+    for (uint8_t h = 0; h < barH; h++)
+      frameBuf[ROWS - 1 - h][col] = DIGIT_BRIGHTNESS;
+  }
+}
+
 // Convert mean-square ADC energy to dB SPL.
 static float energyToDB(float ms) {
   float vRms = sqrtf(ms) / 16383.0f * 3.3f;
   if (vRms < 1e-10f) vRms = 1e-10f;
-  return 20.0f * (logf(vRms) * 0.4342944819f) - MIC_SENSITIVITY_DBV + 94.0f + CAL_OFFSET + runtimeCalOffset;
+  return 20.0f * (logf(vRms) * 0.4342944819f) - MIC_SENSITIVITY_DBV + 94.0f + CAL_OFFSET;
 }
 
 // Accumulate mean-square energy into one of the two Leq accumulators.
@@ -366,7 +416,8 @@ static void updateNavLED() {
   if (currentMode == MODE_A)     out &= ~(1u << NAV_LED_R);
   if (currentMode == MODE_C)     out &= ~(1u << NAV_LED_G);
   if (currentMode == MODE_LAEQ)  out &= ~(1u << NAV_LED_B);
-  if (currentMode == MODE_LCEQ)  { out &= ~(1u << NAV_LED_B); out &= ~(1u << NAV_LED_G); } // cyan
+  if (currentMode == MODE_LCEQ)     { out &= ~(1u << NAV_LED_B); out &= ~(1u << NAV_LED_G); } // cyan
+  if (currentMode == MODE_SPECTRUM)  { out &= ~(1u << NAV_LED_R); out &= ~(1u << NAV_LED_G); out &= ~(1u << NAV_LED_B); } // white
   Wire1.beginTransmission(NAV_ADDR);
   Wire1.write(PCA9554_REG_OUT);
   Wire1.write(out);
@@ -453,103 +504,76 @@ void setup() {
   matrix.begin();
   matrix.setGrayscaleBits(3);  // 8 brightness levels (0-7)
   analogReadResolution(14);
+  memset(specDB, 0, sizeof(specDB));
   setupNavSwitch();
-#if TEST_PWM_D9
-  pinMode(D9, OUTPUT);
-  analogWriteResolution(TEST_PWM_RES);
-  analogWrite(D9, TEST_PWM_DUTY);
-  // Theoretical SPL: square wave duty d → V_rms = Vdd * sqrt(d*(1-d))
-  {
-    float d = TEST_PWM_DUTY / ((float)((1u << TEST_PWM_RES) - 1u));
-    float vRms = 3.3f * sqrtf(d * (1.0f - d));
-    testExpectedDB = 20.0f * (logf(vRms) * 0.4342944819f)
-                     - MIC_SENSITIVITY_DBV + 94.0f + CAL_OFFSET;
-  }
-  Monitor.print(F("TEST_PWM_D9: duty=")); Monitor.print(TEST_PWM_DUTY);
-  Monitor.print(F("/")); Monitor.print((1u << TEST_PWM_RES) - 1u);
-  Monitor.print(F("  expected=")); Monitor.print(testExpectedDB, 1);
-  Monitor.println(F(" dBSPL (unweighted, ideal rails)"));
-  // Auto-calibrate: warm up filters then average 50 blocks against the known signal
-  Monitor.println(F("  calibrating..."));
-  for (uint8_t i = 0; i < 20; i++) { collectBlock(); removeDC(); applyWeighting(MODE_A); } // warm-up
-  float calEnergySum = 0.0f;
-  for (uint8_t i = 0; i < 50; i++) { collectBlock(); removeDC(); applyWeighting(MODE_A); calEnergySum += computeEnergy(); }
-  float measuredDB = energyToDB(calEnergySum / 50.0f); // runtimeCalOffset still 0 here
-  runtimeCalOffset = testExpectedDB - measuredDB;
-  Monitor.print(F("  measured=")); Monitor.print(measuredDB, 1);
-  Monitor.print(F("  cal_offset=")); Monitor.println(runtimeCalOffset, 1);
-#endif
-  Monitor.println(DEMO_MODE ? F("mobile_spl DEMO sweep") : F("mobile_spl live"));
+  Monitor.println(F("mobile_spl live"));
 }
 
 void loop() {
-#if DEMO_MODE
-  WeightMode mode = static_cast<WeightMode>((simDB / 10) % 3);
-  displaySPL(simDB, mode);
-  Monitor.print(F("sim dB = ")); Monitor.println(simDB);
-  sweepUp ? simDB++ : simDB--;
-  if (simDB >= 130) sweepUp = false;
-  if (simDB <= 35)  sweepUp = true;
-  delay(150);
-#else
   static uint8_t blockCount = 0;
+
+  if (!Monitor) Monitor.begin();
 
   pollNavSwitch();
   collectBlock();
   removeDC();
 
-  // Always compute both A-weighted and C-weighted energy
-  applyWeighting(MODE_A);
-  float energyA = computeEnergy();
-  applyWeighting(MODE_C);
-  float energyC = computeEnergy();
-
-  // Feed both LEQ accumulators every block
-  accumulateLeq(0, energyA);
-  accumulateLeq(1, energyC);
-
-  // Live dB for VU bar uses the weighting matching the current mode
-  float energy = (currentMode == MODE_C || currentMode == MODE_LCEQ) ? energyC : energyA;
-  float db     = energyToDB(energy);
-
-  // VU meter + mic dots: refresh every 5 blocks (50 ms)
-  if (++vuCount >= 5) {
-    vuCount = 0;
-    float val;
-    bool  partial = false;
-    if (currentMode == MODE_LAEQ) {
-      val     = leqDB[0];
-      partial = !leqPeriodComplete[0];
-    } else if (currentMode == MODE_LCEQ) {
-      val     = leqDB[1];
-      partial = !leqPeriodComplete[1];
-    } else {
-      val = db;
+  if (currentMode == MODE_SPECTRUM) {
+    // Spectrum mode: FFT-based frequency display, no SPL weighting needed
+    computeSpectrum();
+    if (++vuCount >= 5) {
+      vuCount = 0;
+      displaySpectrum();
+      commitFrame();
     }
-    int intVal = (int)(val + 0.5f);
-    // Always redraw in Leq modes so partial→full brightness transition isn't missed
-    bool forceRedraw = (currentMode == MODE_LAEQ || currentMode == MODE_LCEQ);
-    if (intVal != lastDisplayed || forceRedraw) {
-      lastDisplayed = intVal;
-      displaySPL(intVal, currentMode, partial);
-    }
-    updateBottomRow(db);
-    commitFrame();
-  }
+  } else {
+    // SPL / Leq modes: biquad-weighted energy
+    // Always compute both A-weighted and C-weighted energy
+    applyWeighting(MODE_A);
+    float energyA = computeEnergy();
+    applyWeighting(MODE_C);
+    float energyC = computeEnergy();
 
-  if (++blockCount >= 25) {
-    blockCount = 0;
-#if TEST_PWM_D9
-    Monitor.print(F("measured=")); Monitor.print(db, 1);
-    Monitor.print(F("  expected=")); Monitor.print(testExpectedDB, 1);
-    Monitor.print(F("  delta=")); Monitor.println(db - testExpectedDB, 1);
-#else
-    Monitor.print(F("dBA=")); Monitor.print(energyToDB(energyA), 1);
-    Monitor.print(F("  dBC=")); Monitor.print(energyToDB(energyC), 1);
-    Monitor.print(F("  LAeq=")); Monitor.print(leqDB[0], 1);
-    Monitor.print(F("  LCeq=")); Monitor.println(leqDB[1], 1);
-#endif
+    // Feed both LEQ accumulators every block
+    accumulateLeq(0, energyA);
+    accumulateLeq(1, energyC);
+
+    // Live dB for VU bar uses the weighting matching the current mode
+    float energy = (currentMode == MODE_C || currentMode == MODE_LCEQ) ? energyC : energyA;
+    float db     = energyToDB(energy);
+
+    // VU meter + mic dots: refresh every 5 blocks (50 ms)
+    if (++vuCount >= 5) {
+      vuCount = 0;
+      float val;
+      bool  partial = false;
+      if (currentMode == MODE_LAEQ) {
+        val     = leqDB[0];
+        partial = !leqPeriodComplete[0];
+      } else if (currentMode == MODE_LCEQ) {
+        val     = leqDB[1];
+        partial = !leqPeriodComplete[1];
+      } else {
+        val = db;
+      }
+      int intVal = (int)(val + 0.5f);
+      // Always redraw in Leq modes so partial→full brightness transition isn't missed
+      bool forceRedraw = (currentMode == MODE_LAEQ || currentMode == MODE_LCEQ);
+      if (intVal != lastDisplayed || forceRedraw) {
+        lastDisplayed = intVal;
+        displaySPL(intVal, currentMode, partial);
+      }
+      updateBottomRow(db);
+      commitFrame();
+    }
+
+    if (++blockCount >= 25) {
+      blockCount = 0;
+      Monitor.print(F("dBA=")); Monitor.print(energyToDB(energyA), 1);
+      Monitor.print(F("  dBC=")); Monitor.print(energyToDB(energyC), 1);
+      Monitor.print(F("  LAeq=")); Monitor.print(leqDB[0], 1);
+      Monitor.print(F("  LCeq=")); Monitor.println(leqDB[1], 1);
+    }
   }
-#endif
 }
 
